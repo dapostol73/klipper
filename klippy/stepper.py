@@ -42,6 +42,8 @@ class MCU_stepper:
         self._itersolve_generate_steps = ffi_lib.itersolve_generate_steps
         self._itersolve_check_active = ffi_lib.itersolve_check_active
         self._trapq = ffi_main.NULL
+        self._mcu.get_printer().register_event_handler('klippy:connect',
+                                                       self._query_mcu_position)
     def get_mcu(self):
         return self._mcu
     def get_name(self, short=False):
@@ -115,9 +117,9 @@ class MCU_stepper:
     def get_past_mcu_position(self, print_time):
         clock = self._mcu.print_time_to_clock(print_time)
         ffi_main, ffi_lib = chelper.get_ffi()
-        return ffi_lib.stepcompress_find_past_position(self._stepqueue, clock)
-    def get_past_commanded_position(self, print_time):
-        mcu_pos = self.get_past_mcu_position(print_time)
+        pos = ffi_lib.stepcompress_find_past_position(self._stepqueue, clock)
+        return int(pos)
+    def mcu_to_commanded_position(self, mcu_pos):
         return mcu_pos * self._step_dist - self._mcu_position_offset
     def dump_steps(self, count, start_clock, end_clock):
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -136,7 +138,7 @@ class MCU_stepper:
         self.set_trapq(self._trapq)
         self._set_mcu_position(mcu_pos)
         return old_sk
-    def note_homing_end(self, did_trigger=False):
+    def note_homing_end(self):
         ffi_main, ffi_lib = chelper.get_ffi()
         ret = ffi_lib.stepcompress_reset(self._stepqueue, 0)
         if ret:
@@ -145,16 +147,23 @@ class MCU_stepper:
         ret = ffi_lib.stepcompress_queue_msg(self._stepqueue, data, len(data))
         if ret:
             raise error("Internal error in stepcompress")
-        if not did_trigger or self._mcu.is_fileoutput():
+        self._query_mcu_position()
+    def _query_mcu_position(self):
+        if self._mcu.is_fileoutput():
             return
         params = self._get_position_cmd.send([self._oid])
         last_pos = params['pos']
         if self._invert_dir:
             last_pos = -last_pos
-        ret = ffi_lib.stepcompress_set_last_position(self._stepqueue, last_pos)
+        print_time = self._mcu.estimated_print_time(params['#receive_time'])
+        clock = self._mcu.print_time_to_clock(print_time)
+        ffi_main, ffi_lib = chelper.get_ffi()
+        ret = ffi_lib.stepcompress_set_last_position(self._stepqueue, clock,
+                                                     last_pos)
         if ret:
             raise error("Internal error in stepcompress")
         self._set_mcu_position(last_pos)
+        self._mcu.get_printer().send_event("stepper:sync_mcu_position", self)
     def set_trapq(self, tq):
         ffi_main, ffi_lib = chelper.get_ffi()
         if tq is None:
@@ -205,17 +214,11 @@ def PrinterStepper(config, units_in_radians=False):
 
 # Parse stepper gear_ratio config parameter
 def parse_gear_ratio(config, note_valid):
-    gear_ratio = config.get('gear_ratio', None, note_valid=note_valid)
-    if gear_ratio is None:
-        return 1.
+    gear_ratio = config.getlists('gear_ratio', (), seps=(':', ','), count=2,
+                                 parser=float, note_valid=note_valid)
     result = 1.
-    try:
-        gears = gear_ratio.split(',')
-        for gear in gears:
-            g1, g2 = [float(v.strip()) for v in gear.split(':')]
-            result *= g1 / g2
-    except:
-        raise config.error("Unable to parse gear_ratio: %s" % (gear_ratio,))
+    for g1, g2 in gear_ratio:
+        result *= g1 / g2
     return result
 
 # Obtain "step distance" information from a config section
